@@ -62,7 +62,7 @@ async def health_check():
         status="healthy",
         version=settings.VERSION,
         timestamp=datetime.now().isoformat(),
-        vector_store_status="online (ChromaDB)",
+        vector_store_status="online (Qdrant Cloud)",
         documents_indexed=len(docs),
         total_vectors=total_vectors
     )

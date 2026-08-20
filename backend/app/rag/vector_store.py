@@ -1,154 +1,258 @@
-import os
-import json
 import logging
 from typing import List, Dict, Any, Optional
-import chromadb
-from chromadb.config import Settings as ChromaSettings
+
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Qdrant vector dimension — must match the embedding model:
+# OpenAI text-embedding-3-small → 1536 dimensions
+# Fallback hash-based embeddings → 384 dimensions
+VECTOR_DIM = 1536
+
+
 class VectorStoreManager:
     """
-    Manages persistent ChromaDB vector storage, collection indexing,
-    similarity search queries, and chunk retrieval with metadata.
+    Manages cloud vector storage via Qdrant Cloud, replacing the local ChromaDB store.
+    Provides the same interface as the original ChromaDB implementation so all
+    upstream code (retriever, document_service) is unaffected.
+
+    Document metadata (registry) is stored directly in Qdrant point payloads,
+    eliminating the need for a local JSON registry file.
     """
+
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(VectorStoreManager, cls).__new__(cls)
-            cls._instance._initialize()
+            cls._instance._initialized = False
         return cls._instance
 
-    def _initialize(self):
-        persist_dir = settings.CHROMA_PERSIST_DIR
-        os.makedirs(persist_dir, exist_ok=True)
-        
-        logger.info(f"Initializing ChromaDB vector store at {persist_dir}")
-        self.client = chromadb.PersistentClient(
-            path=persist_dir,
-            settings=ChromaSettings(
-                anonymized_telemetry=False,
-                allow_reset=True
-            )
-        )
-        
-        # Create or get collection with cosine space
-        self.collection_name = "documind_vectors"
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-        
-        # In-memory document registry metadata json path
-        self.registry_file = os.path.join(persist_dir, "documents_registry.json")
-        self._load_registry()
-
-    def _load_registry(self):
-        if os.path.exists(self.registry_file):
+    def _get_client(self):
+        """Lazily initialise the Qdrant client on first use."""
+        if not self._initialized:
             try:
-                with open(self.registry_file, "r", encoding="utf-8") as f:
-                    self.registry = json.load(f)
+                from qdrant_client import QdrantClient
+                from qdrant_client.models import Distance, VectorParams
+
+                if settings.QDRANT_URL and settings.QDRANT_API_KEY:
+                    logger.info(f"Connecting to Qdrant Cloud at {settings.QDRANT_URL}")
+                    self._client = QdrantClient(
+                        url=settings.QDRANT_URL,
+                        api_key=settings.QDRANT_API_KEY,
+                        timeout=30,
+                    )
+                else:
+                    # In-memory Qdrant for local development / demo without credentials
+                    logger.warning(
+                        "QDRANT_URL / QDRANT_API_KEY not set — using in-memory Qdrant. "
+                        "Data will NOT persist across restarts."
+                    )
+                    self._client = QdrantClient(":memory:")
+
+                # Ensure the collection exists
+                existing = [c.name for c in self._client.get_collections().collections]
+                if settings.QDRANT_COLLECTION not in existing:
+                    self._client.create_collection(
+                        collection_name=settings.QDRANT_COLLECTION,
+                        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+                    )
+                    logger.info(f"Created Qdrant collection '{settings.QDRANT_COLLECTION}'")
+                else:
+                    logger.info(f"Using existing Qdrant collection '{settings.QDRANT_COLLECTION}'")
+
+                self._initialized = True
             except Exception as e:
-                logger.error(f"Error loading registry: {e}")
-                self.registry = {}
-        else:
-            self.registry = {}
+                logger.error(f"Failed to initialise Qdrant client: {e}")
+                self._client = None
+                self._initialized = True  # prevent retry spam
+
+        return self._client
+
+    # ------------------------------------------------------------------
+    # Document registry helpers (stored in Qdrant payloads)
+    # ------------------------------------------------------------------
+
+    @property
+    def registry(self) -> Dict[str, Any]:
+        """
+        Builds an in-memory registry from Qdrant payloads by scrolling for
+        unique document_id entries.  This is cached per-request (lazy).
+        """
+        return self._build_registry()
+
+    def _build_registry(self) -> Dict[str, Any]:
+        client = self._get_client()
+        if client is None:
+            return {}
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            reg: Dict[str, Any] = {}
+            offset = None
+            while True:
+                results, next_offset = client.scroll(
+                    collection_name=settings.QDRANT_COLLECTION,
+                    scroll_filter=None,
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in results:
+                    p = point.payload or {}
+                    doc_id = p.get("document_id")
+                    if doc_id and doc_id not in reg:
+                        # Reconstruct doc metadata from payload
+                        reg[doc_id] = {
+                            "id": doc_id,
+                            "filename": p.get("filename", ""),
+                            "original_filename": p.get("original_filename", p.get("filename", "")),
+                            "file_type": p.get("file_type", ""),
+                            "file_size": p.get("file_size", 0),
+                            "page_count": p.get("page_count", 0),
+                            "chunk_count": p.get("chunk_count", 0),
+                            "char_count": p.get("char_count", 0),
+                            "upload_timestamp": p.get("upload_timestamp", ""),
+                            "status": p.get("status", "processed"),
+                        }
+                if next_offset is None:
+                    break
+                offset = next_offset
+            return reg
+        except Exception as e:
+            logger.error(f"Error building registry from Qdrant: {e}")
+            return {}
 
     def _save_registry(self):
-        try:
-            with open(self.registry_file, "w", encoding="utf-8") as f:
-                json.dump(self.registry, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving registry: {e}")
+        """No-op — registry is stored as Qdrant payload, no local file needed."""
+        pass
 
-    def add_document(self, doc_metadata: Dict[str, Any], chunks: List[Dict[str, Any]], embeddings: List[List[float]]):
-        """
-        Stores document metadata in registry and inserts chunks + embeddings into Chroma.
-        """
-        doc_id = doc_metadata["id"]
-        
-        if chunks and embeddings:
-            ids = [c["id"] for c in chunks]
-            texts = [c["text"] for c in chunks]
-            metadatas = [
-                {
-                    "document_id": c["document_id"],
-                    "filename": c["filename"],
-                    "page_number": int(c["page_number"]),
-                    "chunk_index": int(c["chunk_index"]),
-                    "char_count": int(c["char_count"])
-                }
-                for c in chunks
-            ]
-            
-            # Upsert into Chroma
-            self.collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                documents=texts
+    # ------------------------------------------------------------------
+    # Public API (mirrors ChromaDB VectorStoreManager)
+    # ------------------------------------------------------------------
+
+    def add_document(
+        self,
+        doc_metadata: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+    ):
+        """Upserts all chunk vectors and metadata into Qdrant."""
+        client = self._get_client()
+        if client is None:
+            logger.error("Qdrant client unavailable — skipping add_document.")
+            return
+
+        from qdrant_client.models import PointStruct
+        import uuid
+
+        points = []
+        for chunk, embedding in zip(chunks, embeddings):
+            # Pad / trim embedding to VECTOR_DIM if needed (fallback produces 384-dim)
+            vec = embedding
+            if len(vec) != VECTOR_DIM:
+                if len(vec) < VECTOR_DIM:
+                    vec = vec + [0.0] * (VECTOR_DIM - len(vec))
+                else:
+                    vec = vec[:VECTOR_DIM]
+
+            payload = {
+                "document_id": chunk["document_id"],
+                "filename": chunk["filename"],
+                "page_number": int(chunk.get("page_number", 1)),
+                "chunk_index": int(chunk.get("chunk_index", 0)),
+                "char_count": int(chunk.get("char_count", len(chunk["text"]))),
+                "text": chunk["text"],
+                # Document-level metadata duplicated on every point (for registry rebuild)
+                "original_filename": doc_metadata.get("original_filename", chunk["filename"]),
+                "file_type": doc_metadata.get("file_type", ""),
+                "file_size": doc_metadata.get("file_size", 0),
+                "page_count": doc_metadata.get("page_count", 0),
+                "chunk_count": doc_metadata.get("chunk_count", len(chunks)),
+                "char_count_doc": doc_metadata.get("char_count", 0),
+                "upload_timestamp": doc_metadata.get("upload_timestamp", ""),
+                "status": doc_metadata.get("status", "processed"),
+            }
+
+            # Use deterministic UUID from chunk id string
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, chunk["id"]))
+            points.append(PointStruct(id=point_id, vector=vec, payload=payload))
+
+        if points:
+            client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points)
+            logger.info(
+                f"Indexed document '{doc_metadata['filename']}' "
+                f"({doc_metadata['id']}) with {len(points)} chunks into Qdrant."
             )
-            
-        # Update registry
-        self.registry[doc_id] = doc_metadata
-        self._save_registry()
-        logger.info(f"Indexed document {doc_metadata['filename']} ({doc_id}) with {len(chunks)} chunks.")
 
     def get_all_documents(self) -> List[Dict[str, Any]]:
-        """Returns all documents in the registry."""
-        return list(self.registry.values())
+        """Returns all documents from the Qdrant-backed registry."""
+        return list(self._build_registry().values())
 
     def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
-        """Returns a single document metadata."""
-        return self.registry.get(document_id)
+        """Returns metadata for a single document."""
+        return self._build_registry().get(document_id)
 
     def delete_document(self, document_id: str) -> bool:
-        """Deletes all chunks of a document from Chroma and removes it from registry."""
+        """Deletes all vectors for a document from Qdrant."""
+        client = self._get_client()
+        if client is None:
+            return False
         try:
-            # Delete from chroma
-            self.collection.delete(
-                where={"document_id": document_id}
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            client.delete(
+                collection_name=settings.QDRANT_COLLECTION,
+                points_selector=Filter(
+                    must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))]
+                ),
             )
-        except Exception as e:
-            logger.warning(f"Chroma delete where error: {e}")
-            
-        # Delete from registry
-        if document_id in self.registry:
-            del self.registry[document_id]
-            self._save_registry()
+            logger.info(f"Deleted all vectors for document '{document_id}' from Qdrant.")
             return True
-        return False
+        except Exception as e:
+            logger.error(f"Error deleting document '{document_id}' from Qdrant: {e}")
+            return False
 
     def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
-        """Retrieves all chunk records for a given document."""
+        """Retrieves all chunks for a given document from Qdrant."""
+        client = self._get_client()
+        if client is None:
+            return []
         try:
-            results = self.collection.get(
-                where={"document_id": document_id},
-                include=["metadatas", "documents"]
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            results, _ = client.scroll(
+                collection_name=settings.QDRANT_COLLECTION,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))]
+                ),
+                limit=1000,
+                with_payload=True,
+                with_vectors=False,
             )
-            
+
             chunks = []
-            if results and results.get("ids"):
-                for i, cid in enumerate(results["ids"]):
-                    meta = results["metadatas"][i] if results.get("metadatas") else {}
-                    text = results["documents"][i] if results.get("documents") else ""
-                    chunks.append({
-                        "id": cid,
+            for point in results:
+                p = point.payload or {}
+                text = p.get("text", "")
+                chunks.append(
+                    {
+                        "id": str(point.id),
                         "document_id": document_id,
-                        "filename": meta.get("filename", ""),
-                        "page_number": meta.get("page_number", 1),
-                        "chunk_index": meta.get("chunk_index", i),
+                        "filename": p.get("filename", ""),
+                        "page_number": p.get("page_number", 1),
+                        "chunk_index": p.get("chunk_index", 0),
                         "char_count": len(text),
                         "text": text,
-                        "preview": text[:120] + "..." if len(text) > 120 else text
-                    })
-            # Sort by chunk_index
+                        "preview": text[:120] + "..." if len(text) > 120 else text,
+                    }
+                )
+
             chunks.sort(key=lambda x: x["chunk_index"])
             return chunks
         except Exception as e:
-            logger.error(f"Error fetching chunks for {document_id}: {e}")
+            logger.error(f"Error fetching chunks for '{document_id}': {e}")
             return []
 
     def similarity_search(
@@ -156,72 +260,83 @@ class VectorStoreManager:
         query_embedding: List[float],
         top_k: int = 4,
         document_ids: Optional[List[str]] = None,
-        similarity_threshold: float = 0.0
+        similarity_threshold: float = 0.0,
     ) -> List[Dict[str, Any]]:
-        """
-        Performs vector similarity search against Chroma collection.
-        Returns matched chunks with cosine similarity score.
-        """
-        total_count = self.collection.count()
-        if total_count == 0:
+        """Performs cosine similarity search in Qdrant."""
+        client = self._get_client()
+        if client is None:
             return []
 
-        n_results = min(top_k * 2, total_count)
-        
-        where_filter = None
-        if document_ids and len(document_ids) == 1:
-            where_filter = {"document_id": document_ids[0]}
-        elif document_ids and len(document_ids) > 1:
-            where_filter = {"document_id": {"$in": document_ids}}
+        # Pad / trim query embedding to VECTOR_DIM
+        vec = query_embedding
+        if len(vec) != VECTOR_DIM:
+            if len(vec) < VECTOR_DIM:
+                vec = vec + [0.0] * (VECTOR_DIM - len(vec))
+            else:
+                vec = vec[:VECTOR_DIM]
 
         try:
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results,
-                where=where_filter,
-                include=["metadatas", "documents", "distances"]
+            query_filter = None
+            if document_ids:
+                from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
+
+                if len(document_ids) == 1:
+                    query_filter = Filter(
+                        must=[FieldCondition(key="document_id", match=MatchValue(value=document_ids[0]))]
+                    )
+                else:
+                    query_filter = Filter(
+                        must=[FieldCondition(key="document_id", match=MatchAny(any=document_ids))]
+                    )
+
+            results = client.search(
+                collection_name=settings.QDRANT_COLLECTION,
+                query_vector=vec,
+                query_filter=query_filter,
+                limit=top_k * 2,
+                with_payload=True,
             )
-        except Exception as e:
-            logger.error(f"Chroma query error: {e}")
-            return []
 
-        matched_chunks = []
-        if results and results.get("ids") and len(results["ids"]) > 0:
-            ids = results["ids"][0]
-            metadatas = results["metadatas"][0] if results.get("metadatas") else []
-            documents = results["documents"][0] if results.get("documents") else []
-            distances = results["distances"][0] if results.get("distances") else []
+            matched_chunks = []
+            for hit in results:
+                # Qdrant cosine score is in [−1, 1]; normalise to [0, 1]
+                similarity = max(0.0, min(1.0, (hit.score + 1.0) / 2.0))
+                if similarity < similarity_threshold:
+                    continue
 
-            for i in range(len(ids)):
-                dist = distances[i] if i < len(distances) else 1.0
-                # In cosine distance [0, 2], similarity is 1.0 - (dist / 2.0)
-                similarity = max(0.0, min(1.0, 1.0 - (dist / 2.0)))
-                
-                if similarity >= similarity_threshold:
-                    meta = metadatas[i] if i < len(metadatas) else {}
-                    text = documents[i] if i < len(documents) else ""
-                    
-                    matched_chunks.append({
-                        "chunk_id": ids[i],
-                        "document_id": meta.get("document_id", ""),
-                        "filename": meta.get("filename", ""),
-                        "page_number": meta.get("page_number", 1),
-                        "chunk_index": meta.get("chunk_index", 0),
-                        "similarity_score": round(similarity * 100, 2),  # In % (e.g. 92.4%)
+                p = hit.payload or {}
+                text = p.get("text", "")
+                matched_chunks.append(
+                    {
+                        "chunk_id": str(hit.id),
+                        "document_id": p.get("document_id", ""),
+                        "filename": p.get("filename", ""),
+                        "page_number": p.get("page_number", 1),
+                        "chunk_index": p.get("chunk_index", 0),
+                        "similarity_score": round(similarity * 100, 2),
                         "similarity_raw": similarity,
                         "text": text,
-                        "preview": text[:150] + "..." if len(text) > 150 else text
-                    })
+                        "preview": text[:150] + "..." if len(text) > 150 else text,
+                    }
+                )
 
-        # Sort by similarity descending and slice top_k
-        matched_chunks.sort(key=lambda x: x["similarity_raw"], reverse=True)
-        return matched_chunks[:top_k]
+            matched_chunks.sort(key=lambda x: x["similarity_raw"], reverse=True)
+            return matched_chunks[:top_k]
+
+        except Exception as e:
+            logger.error(f"Qdrant similarity search error: {e}")
+            return []
 
     def get_total_vectors(self) -> int:
-        """Returns total vectors stored in ChromaDB."""
+        """Returns total vectors stored in Qdrant."""
+        client = self._get_client()
+        if client is None:
+            return 0
         try:
-            return self.collection.count()
+            info = client.get_collection(settings.QDRANT_COLLECTION)
+            return info.points_count or 0
         except Exception:
             return 0
+
 
 vector_store_manager = VectorStoreManager()

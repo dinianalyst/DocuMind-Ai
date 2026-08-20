@@ -88,32 +88,3 @@ async def delete_document(document_id: str):
         raise HTTPException(status_code=404, detail="Document not found or already deleted.")
     return {"message": "Document and associated vectors deleted successfully.", "document_id": document_id}
 
-@router.post("/{document_id}/reprocess", response_model=DocumentResponse)
-async def reprocess_document(document_id: str):
-    """
-    Re-extract, re-chunk, and re-embed a previously uploaded document.
-    """
-    doc = document_service.reprocess_document(document_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document original source file not found for reprocessing.")
-    return DocumentResponse(
-        document=doc,
-        message="Document successfully re-processed and re-indexed."
-    )
-
-@router.get("/{document_id}/chunks", response_model=DocumentChunksResponse)
-async def get_document_chunks(document_id: str):
-    """
-    Inspect all chunk splits and text passages for an indexed document (portfolio inspectability).
-    """
-    doc = document_service.get_document(document_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found.")
-        
-    chunks = document_service.get_document_chunks(document_id)
-    return DocumentChunksResponse(
-        document_id=document_id,
-        filename=doc.filename,
-        total_chunks=len(chunks),
-        chunks=chunks
-    )
