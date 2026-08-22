@@ -1,4 +1,3 @@
-import React from 'react';
 import { 
   Sparkles, 
   ArrowRight, 
@@ -16,6 +15,8 @@ import {
 interface HeroSectionProps {
   onStartChatting: () => void;
 }
+
+
 
 export const HeroSection: React.FC<HeroSectionProps> = ({ onStartChatting }) => {
   return (

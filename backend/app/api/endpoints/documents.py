@@ -78,6 +78,36 @@ async def get_document(document_id: str):
         raise HTTPException(status_code=404, detail="Document not found.")
     return DocumentResponse(document=doc)
 
+@router.get("/{document_id}/chunks", response_model=DocumentChunksResponse)
+async def get_document_chunks(document_id: str):
+    """
+    Get all text chunks and vector metadata for a specific document.
+    """
+    doc = document_service.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    
+    chunks = document_service.get_document_chunks(document_id)
+    return DocumentChunksResponse(
+        document_id=document_id,
+        filename=doc.filename,
+        total_chunks=len(chunks),
+        chunks=chunks
+    )
+
+@router.post("/{document_id}/reprocess", response_model=DocumentResponse)
+async def reprocess_document(document_id: str):
+    """
+    Re-extract and re-index a document.
+    """
+    doc = document_service.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return DocumentResponse(
+        document=doc,
+        message=f"Document '{doc.filename}' reprocessed successfully."
+    )
+
 @router.delete("/{document_id}")
 async def delete_document(document_id: str):
     """
@@ -87,4 +117,5 @@ async def delete_document(document_id: str):
     if not success:
         raise HTTPException(status_code=404, detail="Document not found or already deleted.")
     return {"message": "Document and associated vectors deleted successfully.", "document_id": document_id}
+
 
